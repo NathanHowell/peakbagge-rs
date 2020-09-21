@@ -4,9 +4,11 @@ use osmio::{Node, OSMObj, OSMObjBase, OSMReader};
 use serde::Deserialize;
 use std::error::Error;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
+use std::ops::Neg;
 use xml;
 use xml::writer::XmlEvent;
+use xml::EventWriter;
 
 #[derive(Debug, Deserialize)]
 struct Peak {
@@ -54,6 +56,74 @@ fn point(lat: f32, lon: f32) -> (f32, f32) {
     (n as f32, e as f32)
 }
 
+fn tag<W: Write>(writer: &mut EventWriter<W>, k: &str, v: &str) -> xml::writer::Result<()> {
+    writer.write(XmlEvent::start_element("tag").attr("k", k).attr("v", v))?;
+
+    writer.write(XmlEvent::end_element())
+}
+
+fn new_peak<W: Write>(
+    writer: &mut EventWriter<W>,
+    id: i32,
+    peak: &Peak,
+) -> xml::writer::Result<()> {
+    writer.write(
+        XmlEvent::start_element("node")
+            .attr("id", id.to_string().as_str())
+            .attr("lat", peak.lat.to_string().as_str())
+            .attr("lon", peak.lon.to_string().as_str()),
+    )?;
+
+    tag(writer, "name", peak.name.as_str())?;
+    tag(
+        writer,
+        "ele",
+        (peak.ele.round() as u32).to_string().clone().as_str(),
+    )?;
+    tag(writer, "natural", "peak")?;
+    writer.write(XmlEvent::end_element())
+}
+
+fn modify_peak<W: Write>(
+    writer: &mut EventWriter<W>,
+    dist: f32,
+    osm_peak: &RcNode,
+    pb_peak: &Peak,
+) -> xml::writer::Result<()> {
+    let dist = dist.sqrt();
+
+    let version = osm_peak.version().unwrap();
+
+    writer.write(
+        XmlEvent::start_element("node")
+            .attr("id", osm_peak.id().to_string().as_str())
+            .attr("action", "modify")
+            .attr("version", version.to_string().as_str())
+            .attr("lat", pb_peak.lat.to_string().as_str())
+            .attr("lon", pb_peak.lon.to_string().as_str()),
+    )?;
+
+    for (k, v) in osm_peak.tags() {
+        writer.write(XmlEvent::start_element("tag").attr("k", k).attr("v", v))?;
+        writer.write(XmlEvent::end_element())?;
+    }
+
+    if !osm_peak.has_tag("ele") {
+        let ele = pb_peak.ele.round() as u32;
+        writer.write(
+            XmlEvent::start_element("tag")
+                .attr("k", "ele")
+                .attr("v", ele.to_string().as_str()),
+        )?;
+        writer.write(XmlEvent::end_element())?;
+    }
+
+    writer.write(XmlEvent::end_element())?;
+
+    println!("{} {:?}", dist, osm_peak);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let osm_peaks = osm_peaks()?;
     let mut index = kdtree::KdTree::with_capacity(2, osm_peaks.len());
@@ -72,56 +142,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         .perform_indent(true)
         .create_writer(target);
     writer.write(xml::writer::XmlEvent::start_element("osm").attr("version", "0.6"))?;
-    for pb_peak in pb_peaks()? {
+    for (idx, pb_peak) in pb_peaks()?.iter().enumerate() {
         let (northing, easting) = point(pb_peak.lat, pb_peak.lon);
-        let nearby = index.within(
-            &[northing, easting],
-            pow(100.0f32, 2), // squared to match metric function
-            &kdtree::distance::squared_euclidean,
-        )?;
+        let nearby = index
+            .within(
+                &[northing, easting],
+                pow(300.0f32, 2), // squared to match metric function
+                &kdtree::distance::squared_euclidean,
+            )?
+            .into_iter()
+            .filter(|(_, node)| node.tag("name") == Some(&pb_peak.name))
+            .collect::<Vec<_>>();
 
-        for (dist, osm_peak) in nearby {
-            if osm_peak.tag("name") != Some(&pb_peak.name) {
-                continue;
+        match nearby.as_slice() {
+            [] => new_peak(&mut writer, -(idx as i32), pb_peak),
+            &[(dist, osm_peak)] => modify_peak(&mut writer, dist, osm_peak, pb_peak),
+            _ => {
+                println!("Ignoring duplicates around {:?}", pb_peak);
+                Ok(())
             }
-
-            if !osm_peak.has_tag("ele") {
-                continue;
-            }
-
-            let dist = dist.sqrt();
-            if dist < 75f32 {
-                continue;
-            }
-
-            let version = osm_peak.version().unwrap();
-
-            writer.write(
-                XmlEvent::start_element("node")
-                    .attr("id", osm_peak.id().to_string().as_str())
-                    .attr("action", "modify")
-                    .attr("version", version.to_string().as_str())
-                    .attr("lat", pb_peak.lat.to_string().as_str())
-                    .attr("lon", pb_peak.lon.to_string().as_str()),
-            )?;
-
-            for (k, v) in osm_peak.tags() {
-                writer.write(XmlEvent::start_element("tag").attr("k", k).attr("v", v))?;
-                writer.write(XmlEvent::end_element())?;
-            }
-
-            // let ele = pb_peak.ele as u32;
-            // writer.write(
-            //     XmlEvent::start_element("tag")
-            //         .attr("k", "ele")
-            //         .attr("v", ele.to_string().as_str()),
-            // )?;
-            // writer.write(XmlEvent::end_element())?;
-
-            writer.write(XmlEvent::end_element())?;
-
-            println!("{} {:?}", dist, osm_peak);
-        }
+        }?;
     }
     writer.write(xml::writer::XmlEvent::end_element())?;
 
